@@ -1,11 +1,12 @@
 {
-  "name": "cortex-ai",
+  "name": "@techiesgult/cortex-mem",
   "version": "0.1.0",
   "description": "Open-source AI memory engine with a living knowledge graph. MCP server for Claude.",
+  "author": "Aravindargutus",
   "type": "module",
   "license": "MIT",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.5.0"
   },
   "repository": {
     "type": "git",
@@ -16,12 +17,13 @@
     "url": "https://github.com/Aravindargutus/cortex-mem/issues"
   },
   "bin": {
-    "cortex-ai": "dist/cli.js"
+    "cortex-mem": "dist/cli.js"
   },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
-    "dist"
+    "dist",
+    "!dist/bench.*"
   ],
   "scripts": {
     "build": "tsup",

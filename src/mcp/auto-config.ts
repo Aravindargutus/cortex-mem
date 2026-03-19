@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, renameSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir, platform } from "os";
 
@@ -53,11 +53,13 @@ export function autoConfigureClaude(): { success: boolean; message: string } {
 
   config.mcpServers["cortex"] = {
     command: "npx",
-    args: ["-y", "cortex-ai", "serve"],
+    args: ["-y", "@techiesgult/cortex-mem", "serve"],
   };
 
   try {
-    writeFileSync(configPath, JSON.stringify(config, null, 2));
+    const tmp = configPath + ".tmp";
+    writeFileSync(tmp, JSON.stringify(config, null, 2), { mode: 0o600 });
+    renameSync(tmp, configPath);
     return {
       success: true,
       message: `Added Cortex to Claude Desktop config at ${configPath}`,

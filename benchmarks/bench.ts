@@ -164,7 +164,7 @@ function evalPass(label: string, value: number): boolean | undefined {
 
 async function main() {
   const dbPath = join(tmpdir(), `cortex-bench-${Date.now()}.db`);
-  const storage = new CortexStorage(dbPath);
+  const storage = new CortexStorage(dbPath, { unsafeSkipPathCheck: true });
   const results: Result[] = [];
 
   console.log("\n" + "═".repeat(70));
@@ -516,7 +516,7 @@ async function main() {
 
     // Build a fresh isolated DB + scheduler for this phase so earlier supersedes don't skew it
     const schedDbPath = join(tmpdir(), `cortex-bench-sched-${Date.now()}.db`);
-    const schedStorage = new CortexStorage(schedDbPath);
+    const schedStorage = new CortexStorage(schedDbPath, { unsafeSkipPathCheck: true });
 
     // Seed the same 25 memories (no supersedes) into this DB
     for (const [, memories] of Object.entries(SEED_DATA)) {

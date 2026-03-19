@@ -33,7 +33,7 @@ export async function embedApi(text: string, apiKey: string, model: string = "te
   });
 
   if (!res.ok) {
-    throw new Error(`Embedding API error: ${res.status} ${await res.text()}`);
+    throw new Error(`Embedding API error: ${res.status}`);
   }
 
   const data = (await res.json()) as { data?: Array<{ embedding: number[] }> };

@@ -6,6 +6,8 @@ import { CortexScheduler } from "../agent/scheduler.js";
 import { embed } from "../embeddings/engine.js";
 import type { CortexConfig, MemoryCategory, MemorySource, Memory, EdgeRelation, RecallResult } from "../types/index.js";
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export class CortexMcpServer {
   private server:    McpServer;
   private storage:   CortexStorage;
@@ -35,7 +37,7 @@ export class CortexMcpServer {
       "memory_save",
       "Save a memory about the user. Call this whenever the user shares a preference, makes a decision, mentions a fact about themselves, or when something important happens. If this memory contradicts or updates an existing one (seen in a previous memory_recall or memory_save response), pass contradicts_id with the old memory's ID. Optionally pass relation to classify the edge type. When saving a consolidation insight from memory_consolidate, set source='consolidated'.",
       {
-        content: z.string().describe("The memory to save. Be specific and factual. e.g. 'User prefers TypeScript over JavaScript'"),
+        content: z.string().max(10_000).describe("The memory to save. Be specific and factual. e.g. 'User prefers TypeScript over JavaScript'"),
         category: z.enum(["fact", "preference", "decision", "event", "insight"]).optional().describe("Type of memory. Use 'preference' for likes/dislikes, 'decision' for choices, 'event' for things that happened, 'insight' for patterns."),
         source: z.enum(["explicit", "consolidated"]).optional().describe("Set to 'consolidated' when saving a pattern discovered via memory_consolidate."),
         contradicts_id: z.string().optional().describe("ID of an existing memory this new one contradicts or replaces. The old memory will be marked superseded."),
@@ -57,6 +59,11 @@ export class CortexMcpServer {
 
         // Handle explicit contradiction from Claude
         if (contradicts_id) {
+          if (!UUID_RE.test(contradicts_id)) {
+            return {
+              content: [{ type: "text" as const, text: `Invalid contradicts_id format: expected a UUID.` }],
+            };
+          }
           this.storage.supersedeMemory(contradicts_id);
           this.storage.addEdge(memory.id, contradicts_id, "contradicts", 1.0);
           contradictionNote = " Superseded a conflicting memory.";
@@ -100,7 +107,7 @@ export class CortexMcpServer {
       "memory_recall",
       "Recall memories relevant to the current context. Uses semantic search and knowledge graph traversal to find the most relevant information. Call this at the start of conversations or when context about the user would be helpful.",
       {
-        query: z.string().describe("What to recall. Can be a topic, question, or context description. e.g. 'What does the user think about databases?' or 'User preferences for programming languages'"),
+        query: z.string().max(2_000).describe("What to recall. Can be a topic, question, or context description. e.g. 'What does the user think about databases?' or 'User preferences for programming languages'"),
         max_results: z.number().optional().describe("Maximum memories to return (default: 10, max: 20)"),
       },
       async ({ query, max_results }) => {
@@ -192,7 +199,7 @@ export class CortexMcpServer {
       "memory_timeline",
       "Show how beliefs or facts about a topic have evolved over time. Returns memories related to the topic in chronological order with the edges connecting them (contradicts, evolved_from, etc). Use when the user asks 'how did my thinking on X change?' or 'show me my history with X'.",
       {
-        topic: z.string().describe("The topic to trace. e.g. 'database choice', 'TypeScript preference', 'Cortex launch strategy'"),
+        topic: z.string().max(2_000).describe("The topic to trace. e.g. 'database choice', 'TypeScript preference', 'Cortex launch strategy'"),
       },
       async ({ topic }) => {
         const embedding = await embed(topic, this.config.embeddingMode, this.config.apiKey);
@@ -363,7 +370,7 @@ export class CortexMcpServer {
           {
             uri: uri.href,
             mimeType: "text/plain",
-            text: `Cortex Memory Stats:\n- Total memories: ${this.storage.getMemoryCount()}\n- Storage: ${this.config.dbPath}\n- Embedding mode: ${this.config.embeddingMode}`,
+            text: `Cortex Memory Stats:\n- Total memories: ${this.storage.getMemoryCount()}\n- Embedding mode: ${this.config.embeddingMode}`,
           },
         ],
       })

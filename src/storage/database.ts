@@ -1,16 +1,24 @@
 import Database from "better-sqlite3";
 import * as sqliteVec from "sqlite-vec";
 import { randomUUID } from "crypto";
-import { dirname } from "path";
+import { dirname, resolve as pathResolve, sep } from "path";
 import { mkdirSync, existsSync } from "fs";
 import { homedir } from "os";
 import type { Memory, Edge, MemoryCategory, MemorySource, EdgeRelation, PendingCluster } from "../types/index.js";
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export class CortexStorage {
   private db: Database.Database;
 
-  constructor(dbPath: string) {
-    const resolved = dbPath.replace("~", homedir());
+  constructor(dbPath: string, opts?: { unsafeSkipPathCheck?: boolean }) {
+    const resolved = pathResolve(dbPath.replace(/^~/, homedir()));
+    if (!opts?.unsafeSkipPathCheck) {
+      const allowedBase = pathResolve(homedir(), ".cortex");
+      if (!resolved.startsWith(allowedBase + sep) && resolved !== allowedBase) {
+        throw new Error(`dbPath must be within ${allowedBase}`);
+      }
+    }
     const dir = dirname(resolved);
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true });
@@ -306,13 +314,16 @@ export class CortexStorage {
       .all(limit) as Array<{ id: string; memory_ids: string; created_at: string; reviewed: number }>;
 
     return rows.map((row) => {
-      const ids: string[] = JSON.parse(row.memory_ids);
+      const parsed = JSON.parse(row.memory_ids);
+      const ids: string[] = (Array.isArray(parsed) ? parsed : [])
+        .filter((v: unknown): v is string => typeof v === "string" && UUID_RE.test(v))
+        .slice(0, 100);
       // Batch-fetch all memories for this cluster in one query
       const placeholders = ids.map(() => "?").join(",");
-      const rows = ids.length > 0
+      const memRows = ids.length > 0
         ? (this.db.prepare(`SELECT * FROM memories WHERE id IN (${placeholders})`).all(...ids) as any[])
         : [];
-      const byId = new Map(rows.map((m) => [m.id, m]));
+      const byId = new Map(memRows.map((m) => [m.id, m]));
       const memories = ids
         .map((mid) => byId.get(mid))
         .filter(Boolean)
