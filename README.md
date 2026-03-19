@@ -32,8 +32,8 @@ npm run bench → 19/19 checks passed
 node -v
 
 # Clone and build
-git clone https://github.com/your-username/cortex
-cd cortex
+git clone https://github.com/Aravindargutus/cortex-mem.git
+cd cortex-mem
 npm install && npm run build
 
 # Auto-configure Claude Desktop

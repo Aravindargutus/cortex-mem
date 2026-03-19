@@ -1,6 +1,6 @@
 {
   "name": "@techiesgult/cortex-mem",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Open-source AI memory engine with a living knowledge graph. MCP server for Claude.",
   "author": "Aravindargutus",
   "type": "module",
