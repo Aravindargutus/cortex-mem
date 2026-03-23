@@ -2,7 +2,7 @@ import { join } from "path";
 import { homedir } from "os";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { CortexMcpServer } from "./mcp/server.js";
-import { autoConfigureClaude } from "./mcp/auto-config.js";
+import { autoConfigureClaude, autoConfigureClaudeCode } from "./mcp/auto-config.js";
 import type { CortexConfig } from "./types/index.js";
 
 // Suppress only the ExperimentalWarning for node:sqlite — not all warnings
@@ -78,15 +78,22 @@ async function main() {
     const config = loadConfig();
     saveConfig(config);
 
-    console.log("\n  🧠 Cortex v0.1.0\n");
+    console.log("\n  🧠 Cortex v0.1.1\n");
     console.log(`  ✓ Config saved to ${CONFIG_PATH}`);
     console.log(`  ✓ Memory database: ${config.dbPath}`);
     console.log(`  ✓ Embedding mode: ${config.embeddingMode}\n`);
 
-    const result = autoConfigureClaude();
-    console.log(`  ${result.success ? "✓" : "✗"} ${result.message}\n`);
-    if (result.success && result.message.includes("Added")) {
-      console.log("  Restart Claude Desktop to connect Cortex.\n");
+    const desktopResult = autoConfigureClaude();
+    console.log(`  ${desktopResult.success ? "✓" : "✗"} ${desktopResult.message}`);
+
+    const codeResult = autoConfigureClaudeCode();
+    console.log(`  ${codeResult.success ? "✓" : "✗"} ${codeResult.message}\n`);
+
+    if (
+      (desktopResult.success && desktopResult.message.includes("Added")) ||
+      (codeResult.success && codeResult.message.includes("Added"))
+    ) {
+      console.log("  Restart Claude Desktop / Claude Code to connect Cortex.\n");
     }
   } else if (command === "stats") {
     const { CortexStorage } = await import("./storage/database.js");
@@ -99,6 +106,34 @@ async function main() {
     console.log(`  Pending patterns: ${pending}`);
     console.log(`  Database:         ${config.dbPath}`);
     console.log(`  Embedding:        ${config.embeddingMode}\n`);
+    storage.close();
+  } else if (command === "forget") {
+    const id = args[1];
+    if (!id) {
+      console.error("  Usage: cortex-mem forget <memory-id>");
+      process.exit(1);
+    }
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRe.test(id)) {
+      console.error("  Error: memory-id must be a valid UUID.");
+      process.exit(1);
+    }
+    const { CortexStorage } = await import("./storage/database.js");
+    const config = loadConfig();
+    const storage = new CortexStorage(config.dbPath);
+    const memory = storage.getMemoryById(id);
+    if (!memory) {
+      console.error(`  Error: Memory ${id} not found.`);
+      storage.close();
+      process.exit(1);
+    }
+    const result = storage.deleteMemory(id);
+    const preview = memory.content.length > 80 ? memory.content.slice(0, 77) + "..." : memory.content;
+    console.log(`\n  🗑️  Deleted: "${preview}" [${memory.category}]`);
+    if (result.edgesRemoved > 0) console.log(`  ✓ Removed ${result.edgesRemoved} graph edge(s)`);
+    if (result.supersededRestored.length > 0) console.log(`  ✓ Restored ${result.supersededRestored.length} previously-superseded memory(ies)`);
+    if (result.clustersAffected > 0) console.log(`  ✓ Updated ${result.clustersAffected} pending cluster(s)`);
+    console.log(`  ✓ Total memories: ${storage.getMemoryCount()}\n`);
     storage.close();
   } else if (command === "daemon") {
     // Stand-alone background agent — runs scheduler independently of Claude Desktop
@@ -149,6 +184,7 @@ async function main() {
     console.log("    npx @techiesgult/cortex-mem setup              Auto-configure Claude Desktop");
     console.log("    npx @techiesgult/cortex-mem serve              Start MCP server (used by Claude)");
     console.log("    npx @techiesgult/cortex-mem stats              Show memory statistics");
+    console.log("    npx @techiesgult/cortex-mem forget <id>        Delete a memory by UUID");
     console.log("    npx @techiesgult/cortex-mem daemon             Run background scheduler continuously");
     console.log("    npx @techiesgult/cortex-mem daemon --once      Single scheduler tick and exit");
     console.log("    npx @techiesgult/cortex-mem daemon --interval=300  Tick every 5 minutes\n");

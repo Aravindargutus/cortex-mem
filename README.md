@@ -1,11 +1,11 @@
 # Cortex — AI Memory for Claude
 
-**Persistent memory with a living knowledge graph. No API key. No cloud. 19/19 benchmark.**
+**Persistent memory with a living knowledge graph. No API key. No cloud. 20/20 benchmark.**
 
-Cortex is an open-source MCP server that gives Claude Desktop persistent memory across every conversation. It stores facts, detects contradictions, builds a typed knowledge graph, and runs a background scheduler that continuously finds patterns in your memories — all locally, all free.
+Cortex is an open-source MCP server that gives Claude Desktop and Claude Code persistent memory across every conversation. It stores facts, detects contradictions, builds a typed knowledge graph, and runs a background scheduler that continuously finds patterns in your memories — all locally, all free.
 
 ```
-npm run bench → 19/19 checks passed
+npm run bench → 20/20 checks passed, 27/27 edge cases passed
 ```
 
 ---
@@ -22,29 +22,60 @@ npm run bench → 19/19 checks passed
 | Token efficiency | **80% savings** | baseline | baseline | baseline |
 | Local embeddings | **✓ MiniLM-L6** | OpenAI API | FastEmbed | ✗ |
 | Claude Desktop | **✓** | ✓ | ✓ | ✓ |
+| Claude Code | **✓** | ✗ | ✗ | ✗ |
 
 ---
 
 ## Install
 
-```bash
-# Requires Node.js v22.5+ (for node:sqlite) — recommend v24
-node -v
+Requires **Node.js v22.5+** (v24 recommended) — needed for `node:sqlite`.
 
-# Clone and build
+### One-command setup (recommended)
+
+```bash
+npx @techiesgult/cortex-mem setup
+```
+
+This auto-configures Claude Desktop's MCP config and downloads the embedding model on first run. Restart Claude Desktop — Cortex is live.
+
+### Or install globally
+
+```bash
+npm install -g @techiesgult/cortex-mem
+cortex-mem setup
+```
+
+### Or install from source
+
+```bash
 git clone https://github.com/Aravindargutus/cortex-mem.git
 cd cortex-mem
 npm install && npm run build
-
-# Auto-configure Claude Desktop
 node dist/cli.js setup
+```
 
-# Restart Claude Desktop — Cortex is live
+### Claude Code
+
+```bash
+claude mcp add cortex -- npx -y @techiesgult/cortex-mem serve
+```
+
+Or add manually to `~/.claude.json`:
+
+```json
+{
+  "mcpServers": {
+    "cortex": {
+      "command": "npx",
+      "args": ["-y", "@techiesgult/cortex-mem", "serve"]
+    }
+  }
+}
 ```
 
 ### Verify it's working
 
-In a Claude Desktop conversation:
+In a Claude Desktop or Claude Code conversation:
 
 ```
 Save this: I prefer TypeScript over JavaScript for all new projects.
@@ -68,7 +99,7 @@ npm run bench
 
 ```
 ══════════════════════════════════════════════════════════════════════
-  CORTEX BENCHMARK  —  2026-03-19  |  Node v24  |  darwin arm64
+  CORTEX BENCHMARK  —  2026-03-23  |  Node v24  |  darwin arm64
 ══════════════════════════════════════════════════════════════════════
 
   ── Embedding latency
@@ -103,7 +134,9 @@ npm run bench
   ✓ Cluster quality         100%    same-topic memories co-clustered
   ✓ Proactive CRUD          100%    save/list/review lifecycle ✓
 
-  SCORE: 19/19 checks passed
+  ── Edge cases              100%    27/27 passed
+
+  SCORE: 20/20 checks passed
 ══════════════════════════════════════════════════════════════════════
 ```
 
@@ -149,6 +182,25 @@ New:        "User switched to Vue.js after React fatigue"
 
 No API key used. Claude does this reasoning itself, using the returned IDs.
 
+### Memory delete
+
+When you ask Claude to forget something:
+
+```
+User: "Actually, forget that I prefer dark mode — I switched to light."
+Claude: memory_delete(memory_id="abc-123", confirm=true)
+→ Deletes memory + embedding + graph edges (atomically)
+→ Scrubs from any pending clusters
+→ If this memory contradicted an older one, restores the older one
+→ "Deleted. Restored 1 previously-superseded memory."
+```
+
+Also available from the CLI:
+
+```bash
+cortex-mem forget abc-123-uuid
+```
+
 ### Background scheduler
 
 Cortex runs a background scheduler that clusters your memories every 30 minutes. When you start a new conversation, Claude can call `memory_proactive` to retrieve pre-computed pattern groups and synthesise them into insights.
@@ -177,6 +229,7 @@ node dist/cli.js daemon
 | Tool | When Claude calls it |
 |---|---|
 | `memory_save` | Anytime something worth remembering is mentioned |
+| `memory_delete` | When user asks to forget something or remove incorrect info |
 | `memory_recall` | Beginning of conversation, or when context helps |
 | `memory_timeline` | "How did my thinking on X change over time?" |
 | `memory_consolidate` | On-demand: cluster and synthesise recent memories |
@@ -196,33 +249,49 @@ Config lives at `~/.cortex/config.json`:
 }
 ```
 
-**Claude Desktop config** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
 ```json
 {
   "mcpServers": {
     "cortex": {
-      "command": "/path/to/node",
-      "args": ["/path/to/cortex/dist/cli.js", "serve"]
+      "command": "npx",
+      "args": ["-y", "@techiesgult/cortex-mem", "serve"]
     }
   }
 }
 ```
 
-> **Note:** Claude Desktop uses its own Node binary which may be v20. Use an absolute path to Node v22.5+ (or v24). Find yours: `which node` after `nvm use 24`.
+**Claude Code** (`~/.claude.json`):
+
+```json
+{
+  "mcpServers": {
+    "cortex": {
+      "command": "npx",
+      "args": ["-y", "@techiesgult/cortex-mem", "serve"]
+    }
+  }
+}
+```
+
+> **Note:** Claude Desktop uses its own Node binary which may be v20. Ensure Node v22.5+ is available on your PATH. Find yours: `which node` after `nvm use 24`.
 
 ---
 
 ## CLI
 
 ```bash
-node dist/cli.js setup           # Auto-configure Claude Desktop
-node dist/cli.js serve           # Start MCP server (Claude does this automatically)
-node dist/cli.js stats           # Show memory count + pending patterns
-node dist/cli.js daemon          # Run background scheduler continuously
-node dist/cli.js daemon --once   # Single scheduler tick and exit
-node dist/cli.js daemon --interval=300  # Tick every 5 minutes
+cortex-mem setup                  # Auto-configure Claude Desktop + Claude Code
+cortex-mem serve                  # Start MCP server (Claude does this automatically)
+cortex-mem stats                  # Show memory count + pending patterns
+cortex-mem forget <uuid>          # Delete a memory by ID
+cortex-mem daemon                 # Run background scheduler continuously
+cortex-mem daemon --once          # Single scheduler tick and exit
+cortex-mem daemon --interval=300  # Tick every 5 minutes
 ```
+
+All commands also work with `npx @techiesgult/cortex-mem <command>`.
 
 ---
 
@@ -251,6 +320,8 @@ Claude Desktop (MCP client)
 CortexMcpServer (stdio MCP)
   ├── memory_save        → CortexStorage.saveMemory()
   │                         └── sqlite-vec (vec0 virtual table, 384-dim)
+  ├── memory_delete      → CortexStorage.deleteMemory()
+  │                         └── cascade edges + vec0 + clusters + supersede restore
   ├── memory_recall      → vectorSearch() + graphWalk()
   ├── memory_timeline    → getTimelineMemories()
   ├── memory_consolidate → embed+cluster on-demand
@@ -274,9 +345,9 @@ Embeddings: @xenova/transformers — Xenova/all-MiniLM-L6-v2 (ONNX, quantized)
 
 ## Requirements
 
-- **Node.js v22.5+** (v24 recommended) — required for `node:sqlite` in the vectore module
+- **Node.js v22.5+** (v24 recommended) — required for `node:sqlite`
 - macOS or Linux (Windows untested)
-- Claude Desktop
+- Claude Desktop or Claude Code
 
 ---
 

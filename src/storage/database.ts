@@ -35,14 +35,15 @@ export class CortexStorage {
   private migrate(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS memories (
-        id          TEXT PRIMARY KEY,
-        content     TEXT NOT NULL,
-        category    TEXT NOT NULL DEFAULT 'fact',
-        source      TEXT NOT NULL DEFAULT 'explicit',
-        confidence  REAL DEFAULT 1.0,
-        created_at  TEXT NOT NULL,
-        updated_at  TEXT NOT NULL,
-        superseded  INTEGER DEFAULT 0
+        id              TEXT PRIMARY KEY,
+        content         TEXT NOT NULL,
+        category        TEXT NOT NULL DEFAULT 'fact',
+        source          TEXT NOT NULL DEFAULT 'explicit',
+        confidence      REAL DEFAULT 1.0,
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT NOT NULL,
+        superseded      INTEGER DEFAULT 0,
+        consolidated_at TEXT
       );
 
       CREATE TABLE IF NOT EXISTS edges (
@@ -133,6 +134,15 @@ export class CortexStorage {
     }));
   }
 
+  edgeExists(sourceId: string, targetId: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 FROM edges WHERE (source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?) LIMIT 1`
+      )
+      .get(sourceId, targetId, targetId, sourceId);
+    return !!row;
+  }
+
   addEdge(sourceId: string, targetId: string, relation: EdgeRelation, strength: number = 1.0): Edge {
     const id = randomUUID();
     const now = new Date().toISOString();
@@ -157,17 +167,37 @@ export class CortexStorage {
     const visited = new Set<string>();
     const results: Array<{ memory: Memory; edges: Edge[]; depth: number }> = [];
 
-    const walk = (ids: string[], depth: number) => {
-      if (depth > maxHops || ids.length === 0) return;
+    let currentIds = startIds.filter((id) => !visited.has(id));
 
-      for (const id of ids) {
-        if (visited.has(id)) continue;
-        visited.add(id);
+    for (let depth = 0; depth <= maxHops && currentIds.length > 0; depth++) {
+      const unvisited = currentIds.filter((id) => !visited.has(id));
+      if (unvisited.length === 0) break;
+      for (const id of unvisited) visited.add(id);
 
-        const memory = this.db.prepare(`SELECT * FROM memories WHERE id = ? AND superseded = 0`).get(id) as any;
+      // Batch-fetch memories for this depth level
+      const placeholders = unvisited.map(() => "?").join(",");
+      const memRows = this.db
+        .prepare(`SELECT * FROM memories WHERE id IN (${placeholders}) AND superseded = 0`)
+        .all(...unvisited) as any[];
+      const memById = new Map(memRows.map((m) => [m.id, m]));
+
+      // Batch-fetch edges for this depth level
+      const edgeRows = this.db
+        .prepare(`SELECT * FROM edges WHERE source_id IN (${placeholders}) OR target_id IN (${placeholders})`)
+        .all(...unvisited, ...unvisited) as Edge[];
+      const edgesByNode = new Map<string, Edge[]>();
+      for (const id of unvisited) edgesByNode.set(id, []);
+      for (const e of edgeRows) {
+        edgesByNode.get(e.source_id)?.push(e);
+        if (e.source_id !== e.target_id) edgesByNode.get(e.target_id)?.push(e);
+      }
+
+      const nextIds: string[] = [];
+      for (const id of unvisited) {
+        const memory = memById.get(id);
         if (!memory) continue;
 
-        const edges = this.getEdgesFrom(id);
+        const edges = edgesByNode.get(id) ?? [];
         results.push({
           memory: {
             id: memory.id,
@@ -183,15 +213,15 @@ export class CortexStorage {
           depth,
         });
 
-        const nextIds = edges
-          .map((e) => (e.source_id === id ? e.target_id : e.source_id))
-          .filter((nid) => !visited.has(nid));
-
-        walk(nextIds, depth + 1);
+        for (const e of edges) {
+          const neighbor = e.source_id === id ? e.target_id : e.source_id;
+          if (!visited.has(neighbor)) nextIds.push(neighbor);
+        }
       }
-    };
 
-    walk(startIds, 0);
+      currentIds = nextIds;
+    }
+
     return results;
   }
 
@@ -240,10 +270,33 @@ export class CortexStorage {
          WHERE superseded = 0
            AND source = 'explicit'
            AND category != 'insight'
+           AND consolidated_at IS NULL
          ORDER BY created_at ASC
          LIMIT ?`
       )
       .all(limit) as Memory[];
+  }
+
+  getUnconsolidatedCount(): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) as count FROM memories
+         WHERE superseded = 0
+           AND source = 'explicit'
+           AND category != 'insight'
+           AND consolidated_at IS NULL`
+      )
+      .get() as any;
+    return row.count;
+  }
+
+  markMemoriesConsolidated(ids: string[]): void {
+    if (ids.length === 0) return;
+    const now = new Date().toISOString();
+    const placeholders = ids.map(() => "?").join(",");
+    this.db
+      .prepare(`UPDATE memories SET consolidated_at = ? WHERE id IN (${placeholders})`)
+      .run(now, ...ids);
   }
 
   /**
@@ -353,6 +406,128 @@ export class CortexStorage {
       .prepare(`SELECT COUNT(*) as count FROM pending_clusters WHERE reviewed = 0`)
       .get() as any;
     return row.count;
+  }
+
+  getMemoryById(id: string): Memory | null {
+    const row = this.db
+      .prepare(`SELECT * FROM memories WHERE id = ?`)
+      .get(id) as any;
+    if (!row) return null;
+    return {
+      id: row.id,
+      content: row.content,
+      category: row.category as MemoryCategory,
+      source: row.source as MemorySource,
+      confidence: row.confidence,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+      superseded: !!row.superseded,
+    };
+  }
+
+  /**
+   * Delete a memory and clean up all references.
+   *
+   * Handles:
+   * 1. edges           — CASCADE from FK, auto-deleted
+   * 2. memory_vectors  — vec0 virtual table, manual DELETE (no CASCADE support)
+   * 3. pending_clusters — scrub ID from JSON; delete cluster if < 2 members remain
+   * 4. supersede chain — if this memory contradicted others, restore them
+   *                      (only if no OTHER memory also contradicts the target)
+   *
+   * Everything runs in a single transaction for atomicity.
+   */
+  deleteMemory(id: string): {
+    deleted: boolean;
+    edgesRemoved: number;
+    supersededRestored: string[];
+    clustersAffected: number;
+  } {
+    const txn = this.db.transaction(() => {
+      // 1. Check existence
+      const memory = this.db.prepare(`SELECT id FROM memories WHERE id = ?`).get(id) as any;
+      if (!memory) {
+        return { deleted: false, edgesRemoved: 0, supersededRestored: [], clustersAffected: 0 };
+      }
+
+      // 2. Count edges that will be cascade-deleted (for reporting)
+      const edgeRow = this.db
+        .prepare(`SELECT COUNT(*) as count FROM edges WHERE source_id = ? OR target_id = ?`)
+        .get(id, id) as any;
+      const edgesRemoved: number = edgeRow.count;
+
+      // 3. Supersede chain restoration:
+      //    Find memories that THIS memory contradicted (source → target with relation='contradicts')
+      //    Only un-supersede if no OTHER memory also contradicts that target
+      const contradictedTargets = this.db
+        .prepare(`SELECT target_id FROM edges WHERE source_id = ? AND relation = 'contradicts'`)
+        .all(id) as Array<{ target_id: string }>;
+
+      const supersededRestored: string[] = [];
+      const now = new Date().toISOString();
+
+      for (const { target_id } of contradictedTargets) {
+        const otherRow = this.db
+          .prepare(
+            `SELECT COUNT(*) as count FROM edges
+             WHERE target_id = ? AND relation = 'contradicts' AND source_id != ?`
+          )
+          .get(target_id, id) as any;
+
+        if (otherRow.count === 0) {
+          this.db
+            .prepare(`UPDATE memories SET superseded = 0, updated_at = ? WHERE id = ?`)
+            .run(now, target_id);
+          supersededRestored.push(target_id);
+        }
+      }
+
+      // 4. Delete from memory_vectors (vec0 virtual table — no CASCADE)
+      this.db.prepare(`DELETE FROM memory_vectors WHERE memory_id = ?`).run(id);
+
+      // 5. Delete from memories (CASCADE auto-deletes edges)
+      this.db.prepare(`DELETE FROM memories WHERE id = ?`).run(id);
+
+      // 6. Scrub from pending_clusters (all clusters, not just unreviewed,
+      //    to avoid ghost IDs in reviewed clusters used for analytics/debugging)
+      const clusters = this.db
+        .prepare(`SELECT id, memory_ids FROM pending_clusters`)
+        .all() as Array<{ id: string; memory_ids: string }>;
+
+      let clustersAffected = 0;
+      for (const cluster of clusters) {
+        let ids: string[];
+        try {
+          ids = JSON.parse(cluster.memory_ids);
+        } catch {
+          continue;
+        }
+        if (!Array.isArray(ids) || !ids.includes(id)) continue;
+
+        const remaining = ids.filter((mid) => mid !== id);
+        if (remaining.length < 2) {
+          // Cluster too small to be useful — remove it
+          this.db.prepare(`DELETE FROM pending_clusters WHERE id = ?`).run(cluster.id);
+        } else {
+          this.db
+            .prepare(`UPDATE pending_clusters SET memory_ids = ? WHERE id = ?`)
+            .run(JSON.stringify(remaining), cluster.id);
+        }
+        clustersAffected++;
+      }
+
+      return { deleted: true, edgesRemoved, supersededRestored, clustersAffected };
+    });
+
+    return txn();
+  }
+
+  getEmbedding(memoryId: string): number[] | null {
+    const row = this.db
+      .prepare(`SELECT embedding FROM memory_vectors WHERE memory_id = ?`)
+      .get(memoryId) as any;
+    if (!row?.embedding) return null;
+    return Array.from(new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4));
   }
 
   close(): void {

@@ -11,21 +11,10 @@
  * in the background without waiting for a user prompt.
  */
 
-import { embedLocal } from "../embeddings/engine.js";
+import { embedLocal, cosineSim } from "../embeddings/engine.js";
 import type { CortexStorage } from "../storage/database.js";
 
 export type SchedulerLogFn = (message: string) => void;
-
-function cosineSim(a: number[], b: number[]): number {
-  let dot = 0, magA = 0, magB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot  += a[i] * b[i];
-    magA += a[i] * a[i];
-    magB += b[i] * b[i];
-  }
-  const denom = Math.sqrt(magA) * Math.sqrt(magB);
-  return denom === 0 ? 0 : dot / denom;
-}
 
 export interface TickResult {
   memoriesScanned: number;
@@ -101,10 +90,11 @@ export class CortexScheduler {
 
       this.log(`[cortex] Scheduler tick — scanning ${memories.length} memories...`);
 
-      // Compute embeddings for every candidate memory
+      // Use existing embeddings from DB when available, fall back to embedLocal
       const embeddings = new Map<string, number[]>();
       for (const m of memories) {
-        embeddings.set(m.id, await embedLocal(m.content));
+        const existing = this.storage.getEmbedding(m.id);
+        embeddings.set(m.id, existing ?? await embedLocal(m.content));
       }
 
       // Greedy cosine-similarity clustering (threshold: 0.70)
@@ -136,10 +126,15 @@ export class CortexScheduler {
 
       // Persist clusters so Claude can review them later via memory_proactive
       let saved = 0;
+      const allClusteredIds: string[] = [];
       for (const cluster of clusters) {
         this.storage.savePendingCluster(cluster);
+        allClusteredIds.push(...cluster);
         saved++;
       }
+
+      // Mark clustered memories so they won't be re-processed
+      this.storage.markMemoriesConsolidated(allClusteredIds);
 
       this.storage.setLastConsolidationTime(new Date().toISOString());
 

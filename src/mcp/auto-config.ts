@@ -6,6 +6,11 @@ interface McpConfig {
   mcpServers: Record<string, { command: string; args: string[] }>;
 }
 
+const CORTEX_ENTRY: { command: string; args: string[] } = {
+  command: "npx",
+  args: ["-y", "@techiesgult/cortex-mem", "serve"],
+};
+
 export function getClaudeConfigPath(): string {
   const home = homedir();
   const os = platform();
@@ -19,8 +24,14 @@ export function getClaudeConfigPath(): string {
   }
 }
 
-export function autoConfigureClaude(): { success: boolean; message: string } {
-  const configPath = getClaudeConfigPath();
+export function getClaudeCodeConfigPath(): string {
+  return join(homedir(), ".claude.json");
+}
+
+function writeMcpConfig(
+  configPath: string,
+  label: string,
+): { success: boolean; message: string } {
   const configDir = join(configPath, "..");
 
   if (!existsSync(configDir)) {
@@ -47,14 +58,11 @@ export function autoConfigureClaude(): { success: boolean; message: string } {
   if (config.mcpServers["cortex"]) {
     return {
       success: true,
-      message: "Cortex is already configured in Claude Desktop.",
+      message: `Cortex is already configured in ${label}.`,
     };
   }
 
-  config.mcpServers["cortex"] = {
-    command: "npx",
-    args: ["-y", "@techiesgult/cortex-mem", "serve"],
-  };
+  config.mcpServers["cortex"] = CORTEX_ENTRY;
 
   try {
     const tmp = configPath + ".tmp";
@@ -62,7 +70,7 @@ export function autoConfigureClaude(): { success: boolean; message: string } {
     renameSync(tmp, configPath);
     return {
       success: true,
-      message: `Added Cortex to Claude Desktop config at ${configPath}`,
+      message: `Added Cortex to ${label} config at ${configPath}`,
     };
   } catch {
     return {
@@ -70,4 +78,12 @@ export function autoConfigureClaude(): { success: boolean; message: string } {
       message: `Failed to write config. Please add manually to ${configPath}`,
     };
   }
+}
+
+export function autoConfigureClaude(): { success: boolean; message: string } {
+  return writeMcpConfig(getClaudeConfigPath(), "Claude Desktop");
+}
+
+export function autoConfigureClaudeCode(): { success: boolean; message: string } {
+  return writeMcpConfig(getClaudeCodeConfigPath(), "Claude Code");
 }
