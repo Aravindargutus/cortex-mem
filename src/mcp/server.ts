@@ -4,7 +4,7 @@ import { z } from "zod";
 import { CortexStorage } from "../storage/database.js";
 import { CortexScheduler } from "../agent/scheduler.js";
 import { embed, cosineSim } from "../embeddings/engine.js";
-import type { CortexConfig, MemoryCategory, MemorySource, Memory, EdgeRelation, RecallResult } from "../types/index.js";
+import type { CortexConfig, MemoryCategory, MemorySource, Memory, EdgeRelation } from "../types/index.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 

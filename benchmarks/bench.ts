@@ -287,7 +287,7 @@ async function main() {
     const cortexAvgTokens = cortexTotalTokens / RECALL_TESTS.length;
 
     const savingsVsFull = ((fullContextTokens - cortexAvgTokens) / fullContextTokens) * 100;
-    const savingsVsRecent = ((recentTenTokens - cortexAvgTokens) / recentTenTokens) * 100;
+    const _savingsVsRecent = ((recentTenTokens - cortexAvgTokens) / recentTenTokens) * 100;
 
     results.push({ label: "Full-context tokens",      value: fullContextTokens,  unit: "tok", note: "all memories in prompt (naive)" });
     results.push({ label: "Recent-10 tokens",         value: recentTenTokens,    unit: "tok", note: "top-10 recent (GPT-style)" });
@@ -311,7 +311,7 @@ async function main() {
       // Save the contradicting update and check if original surfaces in top 3
       const updEmb = await embedLocal(test.update);
       const related = storage.vectorSearch(updEmb, 8);
-      const topRelated = related
+      const _topRelated = related
         .filter((r) => r.memory.id !== origMem.id && r.distance < 0.6)
         .slice(0, 3);
 
@@ -826,7 +826,7 @@ async function main() {
       // Fire two ticks simultaneously
       const [r1, r2] = await Promise.all([scheduler2.tick(), scheduler2.tick()]);
       const oneSkipped = r1.skipped || r2.skipped;
-      const onlyOneRan = (r1.skipped && !r2.skipped) || (!r1.skipped && r2.skipped);
+      const _onlyOneRan = (r1.skipped && !r2.skipped) || (!r1.skipped && r2.skipped);
 
       ecResults.push({
         name: "Concurrent tick prevention",
