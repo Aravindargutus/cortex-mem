@@ -3,7 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { CortexStorage } from "../storage/database.js";
 import { CortexScheduler } from "../agent/scheduler.js";
-import { embed } from "../embeddings/engine.js";
+import { embed, cosineSim } from "../embeddings/engine.js";
 import type { CortexConfig, MemoryCategory, MemorySource, Memory, EdgeRelation, RecallResult } from "../types/index.js";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -24,7 +24,7 @@ export class CortexMcpServer {
 
     this.server = new McpServer({
       name: "cortex",
-      version: "0.1.0",
+      version: "0.1.1",
     });
 
     this.registerTools();
@@ -47,11 +47,24 @@ export class CortexMcpServer {
         const cat = (category || "fact") as MemoryCategory;
         const src = (source || "explicit") as MemorySource;
 
+        // Generate embedding first for dedup check
+        const embedding = await embed(content, this.config.embeddingMode, this.config.apiKey);
+
+        // Check for near-duplicate memories before saving
+        const dupes = this.storage.vectorSearch(embedding, 1);
+        if (dupes.length > 0 && dupes[0].distance < 0.08) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Memory already exists: [id:${dupes[0].memory.id}] "${dupes[0].memory.content}". Skipped duplicate.`,
+            }],
+          };
+        }
+
         // Save the memory
         const memory = this.storage.saveMemory(content, cat, src);
 
-        // Generate and store embedding
-        const embedding = await embed(content, this.config.embeddingMode, this.config.apiKey);
+        // Store embedding
         this.storage.saveEmbedding(memory.id, embedding);
 
         let connections = 0;
@@ -64,9 +77,16 @@ export class CortexMcpServer {
               content: [{ type: "text" as const, text: `Invalid contradicts_id format: expected a UUID.` }],
             };
           }
-          this.storage.supersedeMemory(contradicts_id);
-          this.storage.addEdge(memory.id, contradicts_id, "contradicts", 1.0);
-          contradictionNote = " Superseded a conflicting memory.";
+          // Verify the target memory still exists (it may have been deleted
+          // between recall and this save call)
+          const target = this.storage.getMemoryById(contradicts_id);
+          if (target) {
+            this.storage.supersedeMemory(contradicts_id);
+            this.storage.addEdge(memory.id, contradicts_id, "contradicts", 1.0);
+            contradictionNote = " Superseded a conflicting memory.";
+          } else {
+            contradictionNote = " (contradicts_id not found — target may have been deleted.)";
+          }
         }
 
         // Find semantically related memories and create edges
@@ -76,8 +96,10 @@ export class CortexMcpServer {
           if (match.memory.id === memory.id) continue;
           if (match.memory.id === contradicts_id) continue; // already linked above
           if (match.distance < 0.5) {
-            this.storage.addEdge(memory.id, match.memory.id, edgeRelation, 1 - match.distance);
-            connections++;
+            if (!this.storage.edgeExists(memory.id, match.memory.id)) {
+              this.storage.addEdge(memory.id, match.memory.id, edgeRelation, 1 - match.distance);
+              connections++;
+            }
           }
         }
 
@@ -98,6 +120,68 @@ export class CortexMcpServer {
               text: `Remembered: "${content}" [${cat}] [id:${memory.id}]. Connected to ${connections} related memories. Total: ${count}.${contradictionNote}${relatedNote}`,
             },
           ],
+        };
+      }
+    );
+
+    // memory_delete — permanently remove a memory and clean up all references
+    this.server.tool(
+      "memory_delete",
+      "Permanently delete a memory by ID. Use when the user explicitly asks to forget something, or to remove incorrect/outdated information. This will also clean up related graph edges, embeddings, and pending clusters. If the deleted memory had contradicted an older memory, that older memory will be restored (un-superseded) automatically.",
+      {
+        memory_id: z.string().describe("The UUID of the memory to delete. Get this from memory_recall or memory_timeline."),
+        confirm: z.boolean().optional().describe("Set to true to confirm deletion. If omitted or false, returns a preview of what will be affected without deleting."),
+      },
+      async ({ memory_id, confirm }) => {
+        if (!UUID_RE.test(memory_id)) {
+          return {
+            content: [{ type: "text" as const, text: `Invalid memory_id format: expected a UUID.` }],
+          };
+        }
+
+        const memory = this.storage.getMemoryById(memory_id);
+        if (!memory) {
+          return {
+            content: [{ type: "text" as const, text: `Memory not found: ${memory_id}. It may have already been deleted.` }],
+          };
+        }
+
+        // Preview mode — show what will be affected without deleting
+        if (!confirm) {
+          const edges = this.storage.getEdgesFrom(memory_id);
+          const contradicts = edges.filter((e) => e.source_id === memory_id && e.relation === "contradicts");
+          const preview = [
+            `Memory to delete: [id:${memory.id}] [${memory.category}] "${memory.content}"`,
+            `Edges that will be removed: ${edges.length}`,
+          ];
+          if (contradicts.length > 0) {
+            preview.push(`Superseded memories that will be restored: ${contradicts.length}`);
+          }
+          preview.push(`\nCall memory_delete again with confirm=true to proceed.`);
+          return {
+            content: [{ type: "text" as const, text: preview.join("\n") }],
+          };
+        }
+
+        // Confirmed — perform the delete
+        const result = this.storage.deleteMemory(memory_id);
+
+        if (!result.deleted) {
+          return {
+            content: [{ type: "text" as const, text: `Memory not found: ${memory_id}. It may have been deleted between preview and confirm.` }],
+          };
+        }
+
+        const parts = [`Deleted: "${memory.content}" [${memory.category}]`];
+        if (result.edgesRemoved > 0) parts.push(`Removed ${result.edgesRemoved} graph edge(s).`);
+        if (result.supersededRestored.length > 0) {
+          parts.push(`Restored ${result.supersededRestored.length} previously-superseded memory(ies).`);
+        }
+        if (result.clustersAffected > 0) parts.push(`Updated ${result.clustersAffected} pending cluster(s).`);
+        parts.push(`Total memories: ${this.storage.getMemoryCount()}.`);
+
+        return {
+          content: [{ type: "text" as const, text: parts.join(" ") }],
         };
       }
     );
@@ -174,8 +258,7 @@ export class CortexMcpServer {
         const tokenEstimate = Math.ceil(lines.join("\n").length / 4);
 
         // Nudge consolidation if there are enough unconsolidated memories
-        const unconsolidatedMemories = this.storage.getUnconsolidatedMemories(50);
-        const unconsolidatedCount = unconsolidatedMemories.length;
+        const unconsolidatedCount = this.storage.getUnconsolidatedCount();
         const lastRun = this.storage.getLastConsolidationTime();
         const hourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
         const consolidationDue = unconsolidatedCount >= 10 && (!lastRun || lastRun < hourAgo);
@@ -277,11 +360,7 @@ export class CortexMcpServer {
           for (const other of memories) {
             if (clustered.has(other.id) || cluster.length >= 8) continue;
             const otherEmb = embeddings.get(other.id)!;
-            // Cosine similarity: dot product of normalized vectors
-            const dot = anchor.reduce((sum, a, i) => sum + a * otherEmb[i], 0);
-            const magA = Math.sqrt(anchor.reduce((s, a) => s + a * a, 0));
-            const magB = Math.sqrt(otherEmb.reduce((s, b) => s + b * b, 0));
-            const sim = dot / (magA * magB);
+            const sim = cosineSim(anchor, otherEmb);
             if (sim > 0.7) {
               cluster.push(other);
               clustered.add(other.id);
@@ -303,6 +382,10 @@ export class CortexMcpServer {
         }
 
         this.storage.setLastConsolidationTime(new Date().toISOString());
+
+        // Mark all clustered memories as consolidated
+        const allClusteredIds = clusters.flatMap((c) => c.map((m) => m.id));
+        this.storage.markMemoriesConsolidated(allClusteredIds);
 
         const clusterText = clusters.map((cluster, i) => {
           const items = cluster.map((m) => `  - [${m.category}] ${m.content}`).join("\n");

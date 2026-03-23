@@ -29,7 +29,7 @@ export async function embedApi(text: string, apiKey: string, model: string = "te
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ model, input: text }),
+    body: JSON.stringify({ model, input: text, dimensions: 384 }),
   });
 
   if (!res.ok) {
@@ -41,6 +41,17 @@ export async function embedApi(text: string, apiKey: string, model: string = "te
     throw new Error(`Embedding API returned unexpected response shape`);
   }
   return data.data[0].embedding;
+}
+
+export function cosineSim(a: number[], b: number[]): number {
+  let dot = 0, magA = 0, magB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot  += a[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(magA) * Math.sqrt(magB);
+  return denom === 0 ? 0 : dot / denom;
 }
 
 export async function embed(

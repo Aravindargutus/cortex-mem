@@ -16,6 +16,8 @@
  *   12. Scheduler tick — latency, cluster quality, pending CRUD
  *   13. Proactive cluster correctness (review lifecycle, count accuracy)
  *   14. Storage efficiency (bytes per memory)
+ *   15. Edge cases — deduplication, edge dedup, empty/unicode/long content,
+ *       consolidated_at marking, embedding retrieval, concurrent scheduler
  *
  * Usage:
  *   npm run bench
@@ -148,6 +150,7 @@ const PASS_THRESHOLDS: Record<string, number> = {
   "Scheduler tick latency":     10_000, // <10 s (25 memories + embed)
   "Scheduler cluster quality":  60,     // >60 % of found clusters have ≥2 members from same topic
   "Proactive CRUD correctness": 100,    // save / list / mark-reviewed / count all correct
+  "Edge case pass rate":         100,    // all edge cases must pass
 };
 
 function evalPass(label: string, value: number): boolean | undefined {
@@ -647,6 +650,575 @@ async function main() {
     results.push({ label: "Metadata overhead",      value: overhead,         unit: "%",   note: "shrinks toward ~10% at 1k+ memories" });
 
     // -----------------------------------------------------------------------
+    // PHASE 15: EDGE CASES
+    // -----------------------------------------------------------------------
+    console.log("[15/15] Edge cases...");
+
+    const edgeCaseDb = join(tmpdir(), `cortex-bench-edge-${Date.now()}.db`);
+    const ecStorage = new CortexStorage(edgeCaseDb, { unsafeSkipPathCheck: true });
+    const ecResults: Array<{ name: string; pass: boolean; note: string }> = [];
+
+    // EC1: Near-duplicate detection — saving the same content twice should
+    //      produce two distinct rows (dedup is in server.ts, not storage layer)
+    //      but storage.vectorSearch should find them with distance ≈ 0
+    {
+      const m1 = ecStorage.saveMemory("User prefers dark mode", "preference");
+      const e1 = await embedLocal("User prefers dark mode");
+      ecStorage.saveEmbedding(m1.id, e1);
+
+      const m2 = ecStorage.saveMemory("User prefers dark mode", "preference");
+      const e2 = await embedLocal("User prefers dark mode");
+      ecStorage.saveEmbedding(m2.id, e2);
+
+      const search = ecStorage.vectorSearch(e1, 5);
+      const found = search.filter((r) => r.distance < 0.01);
+      const hasBoth = found.some((r) => r.memory.id === m1.id) && found.some((r) => r.memory.id === m2.id);
+      ecResults.push({
+        name: "Near-duplicate detection",
+        pass: hasBoth && found.length >= 2,
+        note: `distance=${found[0]?.distance.toFixed(4) ?? "N/A"} found=${found.length}`,
+      });
+    }
+
+    // EC2: Edge deduplication — edgeExists should prevent creating same edge twice
+    {
+      const ma = ecStorage.saveMemory("Test memory A", "fact");
+      const mb = ecStorage.saveMemory("Test memory B", "fact");
+      ecStorage.addEdge(ma.id, mb.id, "relates_to", 0.9);
+
+      const existsBefore = ecStorage.edgeExists(ma.id, mb.id);
+      const existsReverse = ecStorage.edgeExists(mb.id, ma.id); // both directions
+
+      ecResults.push({
+        name: "Edge dedup (forward)",
+        pass: existsBefore === true,
+        note: `edgeExists(A→B)=${existsBefore}`,
+      });
+      ecResults.push({
+        name: "Edge dedup (reverse)",
+        pass: existsReverse === true,
+        note: `edgeExists(B→A)=${existsReverse}`,
+      });
+    }
+
+    // EC3: Empty content embedding — should not crash
+    {
+      let emptyOk = false;
+      try {
+        const emb = await embedLocal("");
+        emptyOk = Array.isArray(emb) && emb.length === 384;
+      } catch {
+        emptyOk = false;
+      }
+      ecResults.push({
+        name: "Empty string embed",
+        pass: emptyOk,
+        note: emptyOk ? "384-dim vector returned" : "CRASHED",
+      });
+    }
+
+    // EC4: Unicode / emoji content
+    {
+      const unicodeContent = "用户喜欢深色模式 🌙 и использует TypeScript 🚀";
+      let unicodeOk = false;
+      try {
+        const mem = ecStorage.saveMemory(unicodeContent, "fact");
+        const emb = await embedLocal(unicodeContent);
+        ecStorage.saveEmbedding(mem.id, emb);
+        const results = ecStorage.vectorSearch(emb, 3);
+        unicodeOk = results.some((r) => r.memory.id === mem.id);
+      } catch {
+        unicodeOk = false;
+      }
+      ecResults.push({
+        name: "Unicode/emoji content",
+        pass: unicodeOk,
+        note: unicodeOk ? "saved + recalled ✓" : "FAILED",
+      });
+    }
+
+    // EC5: Very long content (near 10K limit)
+    {
+      const longContent = "User ".padEnd(9000, "prefers TypeScript for projects. ");
+      let longOk = false;
+      try {
+        const mem = ecStorage.saveMemory(longContent, "fact");
+        const emb = await embedLocal(longContent);
+        ecStorage.saveEmbedding(mem.id, emb);
+        const results = ecStorage.vectorSearch(emb, 3);
+        longOk = results.some((r) => r.memory.id === mem.id);
+      } catch {
+        longOk = false;
+      }
+      ecResults.push({
+        name: "Long content (9KB)",
+        pass: longOk,
+        note: longOk ? `${longContent.length} chars saved + recalled` : "FAILED",
+      });
+    }
+
+    // EC6: consolidated_at marking — memories marked consolidated should not appear
+    //      in getUnconsolidatedMemories
+    {
+      const cm1 = ecStorage.saveMemory("Consolidation test A", "fact");
+      const cm2 = ecStorage.saveMemory("Consolidation test B", "fact");
+      const cm3 = ecStorage.saveMemory("Consolidation test C", "fact");
+
+      const beforeCount = ecStorage.getUnconsolidatedCount();
+      ecStorage.markMemoriesConsolidated([cm1.id, cm2.id]);
+      const afterCount = ecStorage.getUnconsolidatedCount();
+
+      const remaining = ecStorage.getUnconsolidatedMemories(100);
+      const cm1InRemaining = remaining.some((m) => m.id === cm1.id);
+      const cm2InRemaining = remaining.some((m) => m.id === cm2.id);
+      const cm3InRemaining = remaining.some((m) => m.id === cm3.id);
+
+      const markOk = !cm1InRemaining && !cm2InRemaining && cm3InRemaining && afterCount === beforeCount - 2;
+      ecResults.push({
+        name: "consolidated_at filter",
+        pass: markOk,
+        note: `before=${beforeCount} after=${afterCount} unmarked-visible=${cm3InRemaining}`,
+      });
+    }
+
+    // EC7: getEmbedding round-trip — stored embedding should be retrievable
+    {
+      const em = ecStorage.saveMemory("Embedding roundtrip test", "fact");
+      const originalEmb = await embedLocal("Embedding roundtrip test");
+      ecStorage.saveEmbedding(em.id, originalEmb);
+
+      const retrieved = ecStorage.getEmbedding(em.id);
+      let roundtripOk = false;
+      if (retrieved && retrieved.length === 384) {
+        // Check first 10 values are approximately equal (float32 precision)
+        roundtripOk = originalEmb.slice(0, 10).every((v, i) => Math.abs(v - retrieved[i]) < 1e-5);
+      }
+      ecResults.push({
+        name: "Embedding roundtrip",
+        pass: roundtripOk,
+        note: roundtripOk ? "384-dim match ✓" : `MISMATCH len=${retrieved?.length ?? 0}`,
+      });
+    }
+
+    // EC8: getEmbedding for non-existent ID
+    {
+      const missing = ecStorage.getEmbedding("00000000-0000-0000-0000-000000000000");
+      ecResults.push({
+        name: "Missing embedding returns null",
+        pass: missing === null,
+        note: `got=${missing === null ? "null" : typeof missing}`,
+      });
+    }
+
+    // EC9: Scheduler double-tick prevention — concurrent ticks should not overlap
+    {
+      const schedDb2 = join(tmpdir(), `cortex-bench-sched2-${Date.now()}.db`);
+      const sched2Storage = new CortexStorage(schedDb2, { unsafeSkipPathCheck: true });
+
+      // Seed enough memories to trigger clustering
+      for (let i = 0; i < 10; i++) {
+        const m = sched2Storage.saveMemory(`TypeScript pattern ${i}: use strict types`, "fact");
+        sched2Storage.saveEmbedding(m.id, await embedLocal(m.content));
+      }
+
+      const scheduler2 = new CortexScheduler(sched2Storage);
+
+      // Fire two ticks simultaneously
+      const [r1, r2] = await Promise.all([scheduler2.tick(), scheduler2.tick()]);
+      const oneSkipped = r1.skipped || r2.skipped;
+      const onlyOneRan = (r1.skipped && !r2.skipped) || (!r1.skipped && r2.skipped);
+
+      ecResults.push({
+        name: "Concurrent tick prevention",
+        pass: oneSkipped,
+        note: `tick1: scanned=${r1.memoriesScanned} skip=${r1.skipped} | tick2: scanned=${r2.memoriesScanned} skip=${r2.skipped}`,
+      });
+
+      sched2Storage.close();
+      if (existsSync(schedDb2)) unlinkSync(schedDb2);
+    }
+
+    // EC10: Scheduler re-tick after consolidation — should not re-cluster same memories
+    {
+      const schedDb3 = join(tmpdir(), `cortex-bench-sched3-${Date.now()}.db`);
+      const sched3Storage = new CortexStorage(schedDb3, { unsafeSkipPathCheck: true });
+
+      for (let i = 0; i < 8; i++) {
+        const m = sched3Storage.saveMemory(`Database fact ${i}: SQLite is fast`, "fact");
+        sched3Storage.saveEmbedding(m.id, await embedLocal(m.content));
+      }
+
+      const scheduler3 = new CortexScheduler(sched3Storage);
+      const tick1 = await scheduler3.tick();
+      const tick2 = await scheduler3.tick();
+
+      // After first tick marks memories as consolidated, second tick should see fewer or skip
+      const noRecluster = tick2.skipped || tick2.clustersSaved === 0;
+      ecResults.push({
+        name: "No re-clustering after consolidation",
+        pass: noRecluster,
+        note: `tick1: clusters=${tick1.clustersSaved} | tick2: clusters=${tick2.clustersSaved} skip=${tick2.skipped}`,
+      });
+
+      sched3Storage.close();
+      if (existsSync(schedDb3)) unlinkSync(schedDb3);
+    }
+
+    // EC11: Graph walk with no edges — should return the start nodes without crashing
+    {
+      const isolated1 = ecStorage.saveMemory("Isolated memory one", "fact");
+      const isolated2 = ecStorage.saveMemory("Isolated memory two", "fact");
+      const walkResult = ecStorage.graphWalk([isolated1.id, isolated2.id], 2);
+      const walkedBoth = walkResult.length === 2;
+      ecResults.push({
+        name: "Graph walk (no edges)",
+        pass: walkedBoth,
+        note: `expected 2 nodes, got ${walkResult.length}`,
+      });
+    }
+
+    // EC12: Graph walk with invalid/missing IDs — should not crash
+    {
+      const walkBad = ecStorage.graphWalk(["nonexistent-id", "also-fake"], 2);
+      ecResults.push({
+        name: "Graph walk (invalid IDs)",
+        pass: walkBad.length === 0,
+        note: `expected 0 results, got ${walkBad.length}`,
+      });
+    }
+
+    // EC13: Vector search on empty DB — should return empty, not crash
+    {
+      const emptyDb = join(tmpdir(), `cortex-bench-empty-${Date.now()}.db`);
+      const emptyStorage = new CortexStorage(emptyDb, { unsafeSkipPathCheck: true });
+      const emb = await embedLocal("anything at all");
+      const emptyResults = emptyStorage.vectorSearch(emb, 10);
+      ecResults.push({
+        name: "Vector search (empty DB)",
+        pass: emptyResults.length === 0,
+        note: `got ${emptyResults.length} results`,
+      });
+      emptyStorage.close();
+      if (existsSync(emptyDb)) unlinkSync(emptyDb);
+    }
+
+    // EC14: Supersede then un-supersede scenario — supersedeMemory is one-way
+    //       (no unsupersede method, so verify it stays superseded)
+    {
+      const sup = ecStorage.saveMemory("Will be superseded", "fact");
+      const supEmb = await embedLocal(sup.content);
+      ecStorage.saveEmbedding(sup.id, supEmb);
+
+      ecStorage.supersedeMemory(sup.id);
+      const afterSup = ecStorage.vectorSearch(supEmb, 10);
+      const hidden = !afterSup.some((r) => r.memory.id === sup.id);
+
+      ecResults.push({
+        name: "Supersede is permanent",
+        pass: hidden,
+        note: hidden ? "not in vector search ✓" : "LEAKED into results",
+      });
+    }
+
+    // EC15: Multiple edge types between same memories
+    {
+      const meA = ecStorage.saveMemory("Multi-edge test A", "fact");
+      const meB = ecStorage.saveMemory("Multi-edge test B", "fact");
+      ecStorage.addEdge(meA.id, meB.id, "relates_to", 0.8);
+      ecStorage.addEdge(meA.id, meB.id, "evolved_from", 0.9);
+
+      const edges = ecStorage.getEdgesFrom(meA.id);
+      const hasRelates = edges.some((e) => e.relation === "relates_to");
+      const hasEvolved = edges.some((e) => e.relation === "evolved_from");
+      ecResults.push({
+        name: "Multiple edge types",
+        pass: hasRelates && hasEvolved,
+        note: `${edges.length} edges, relates_to=${hasRelates} evolved_from=${hasEvolved}`,
+      });
+    }
+
+    // EC16: getUnconsolidatedCount matches getUnconsolidatedMemories length
+    {
+      const countVal = ecStorage.getUnconsolidatedCount();
+      const listVal = ecStorage.getUnconsolidatedMemories(200);
+      ecResults.push({
+        name: "Count vs list consistency",
+        pass: countVal === listVal.length,
+        note: `count()=${countVal} list().length=${listVal.length}`,
+      });
+    }
+
+    // ── DELETE EDGE CASES ──
+
+    // EC17: Delete a basic memory — verify removed from memories, vectors, and edges
+    {
+      const delDb = join(tmpdir(), `cortex-bench-del-${Date.now()}.db`);
+      const delStorage = new CortexStorage(delDb, { unsafeSkipPathCheck: true });
+
+      const m = delStorage.saveMemory("Memory to delete", "fact");
+      const emb = await embedLocal(m.content);
+      delStorage.saveEmbedding(m.id, emb);
+
+      const result = delStorage.deleteMemory(m.id);
+      const afterSearch = delStorage.vectorSearch(emb, 10);
+      const embAfter = delStorage.getEmbedding(m.id);
+      const memAfter = delStorage.getMemoryById(m.id);
+
+      ecResults.push({
+        name: "Delete basic memory",
+        pass: result.deleted && !afterSearch.some((r) => r.memory.id === m.id) && embAfter === null && memAfter === null,
+        note: `deleted=${result.deleted} vec=${afterSearch.length} emb=${embAfter === null} mem=${memAfter === null}`,
+      });
+
+      delStorage.close();
+      if (existsSync(delDb)) unlinkSync(delDb);
+    }
+
+    // EC18: Delete non-existent memory — should return deleted=false
+    {
+      const delDb2 = join(tmpdir(), `cortex-bench-del2-${Date.now()}.db`);
+      const delStorage2 = new CortexStorage(delDb2, { unsafeSkipPathCheck: true });
+
+      const result = delStorage2.deleteMemory("00000000-0000-0000-0000-000000000000");
+      ecResults.push({
+        name: "Delete non-existent memory",
+        pass: result.deleted === false && result.edgesRemoved === 0,
+        note: `deleted=${result.deleted}`,
+      });
+
+      delStorage2.close();
+      if (existsSync(delDb2)) unlinkSync(delDb2);
+    }
+
+    // EC19: Delete memory with edges — verify CASCADE removes edges
+    {
+      const delDb3 = join(tmpdir(), `cortex-bench-del3-${Date.now()}.db`);
+      const delStorage3 = new CortexStorage(delDb3, { unsafeSkipPathCheck: true });
+
+      const mA = delStorage3.saveMemory("Edge source", "fact");
+      const mB = delStorage3.saveMemory("Edge target 1", "fact");
+      const mC = delStorage3.saveMemory("Edge target 2", "fact");
+      delStorage3.addEdge(mA.id, mB.id, "relates_to", 0.9);
+      delStorage3.addEdge(mA.id, mC.id, "led_to", 0.8);
+      delStorage3.addEdge(mB.id, mC.id, "relates_to", 0.7); // unrelated edge should survive
+
+      const result = delStorage3.deleteMemory(mA.id);
+
+      // Edges from A should be gone but B↔C edge should survive
+      const edgesB = delStorage3.getEdgesFrom(mB.id);
+      const bcEdgeSurvived = edgesB.some((e) =>
+        (e.source_id === mB.id && e.target_id === mC.id) ||
+        (e.source_id === mC.id && e.target_id === mB.id)
+      );
+
+      ecResults.push({
+        name: "Delete cascades edges",
+        pass: result.deleted && result.edgesRemoved === 2 && bcEdgeSurvived,
+        note: `removed=${result.edgesRemoved} B↔C survived=${bcEdgeSurvived}`,
+      });
+
+      delStorage3.close();
+      if (existsSync(delDb3)) unlinkSync(delDb3);
+    }
+
+    // EC20: Delete memory that contradicted another — should restore superseded
+    {
+      const delDb4 = join(tmpdir(), `cortex-bench-del4-${Date.now()}.db`);
+      const delStorage4 = new CortexStorage(delDb4, { unsafeSkipPathCheck: true });
+
+      const old = delStorage4.saveMemory("I use Postgres", "decision");
+      const oldEmb = await embedLocal(old.content);
+      delStorage4.saveEmbedding(old.id, oldEmb);
+
+      // Supersede the old memory
+      delStorage4.supersedeMemory(old.id);
+      const newer = delStorage4.saveMemory("I switched to SQLite", "decision");
+      const newerEmb = await embedLocal(newer.content);
+      delStorage4.saveEmbedding(newer.id, newerEmb);
+      delStorage4.addEdge(newer.id, old.id, "contradicts", 1.0);
+
+      // Old should be hidden from vector search
+      const beforeDelete = delStorage4.vectorSearch(oldEmb, 10);
+      const oldHiddenBefore = !beforeDelete.some((r) => r.memory.id === old.id);
+
+      // Delete the newer one — should restore the old
+      const result = delStorage4.deleteMemory(newer.id);
+      const afterDelete = delStorage4.vectorSearch(oldEmb, 10);
+      const oldRestoredAfter = afterDelete.some((r) => r.memory.id === old.id);
+
+      ecResults.push({
+        name: "Delete restores superseded",
+        pass: result.deleted && result.supersededRestored.length === 1 && oldHiddenBefore && oldRestoredAfter,
+        note: `restored=${result.supersededRestored.length} hiddenBefore=${oldHiddenBefore} visibleAfter=${oldRestoredAfter}`,
+      });
+
+      delStorage4.close();
+      if (existsSync(delDb4)) unlinkSync(delDb4);
+    }
+
+    // EC21: Multiple contradictions — delete one contradicting memory, but another
+    //       still contradicts the target → target should stay superseded
+    {
+      const delDb5 = join(tmpdir(), `cortex-bench-del5-${Date.now()}.db`);
+      const delStorage5 = new CortexStorage(delDb5, { unsafeSkipPathCheck: true });
+
+      const original = delStorage5.saveMemory("I use Java", "fact");
+      delStorage5.supersedeMemory(original.id);
+
+      const contra1 = delStorage5.saveMemory("Switched to Kotlin", "fact");
+      delStorage5.addEdge(contra1.id, original.id, "contradicts", 1.0);
+
+      const contra2 = delStorage5.saveMemory("Now using Kotlin full-time", "fact");
+      delStorage5.addEdge(contra2.id, original.id, "contradicts", 1.0);
+
+      // Delete only one contradictor — original should remain superseded
+      const result = delStorage5.deleteMemory(contra1.id);
+      const stillSuperseded = delStorage5.getMemoryById(original.id);
+
+      ecResults.push({
+        name: "Multi-contradict keeps supersede",
+        pass: result.deleted && result.supersededRestored.length === 0 && stillSuperseded?.superseded === true,
+        note: `restored=${result.supersededRestored.length} stillSup=${stillSuperseded?.superseded}`,
+      });
+
+      delStorage5.close();
+      if (existsSync(delDb5)) unlinkSync(delDb5);
+    }
+
+    // EC22: Delete memory from pending cluster — cluster should be scrubbed
+    {
+      const delDb6 = join(tmpdir(), `cortex-bench-del6-${Date.now()}.db`);
+      const delStorage6 = new CortexStorage(delDb6, { unsafeSkipPathCheck: true });
+
+      const cm1 = delStorage6.saveMemory("Cluster mem 1", "fact");
+      const cm2 = delStorage6.saveMemory("Cluster mem 2", "fact");
+      const cm3 = delStorage6.saveMemory("Cluster mem 3", "fact");
+      delStorage6.savePendingCluster([cm1.id, cm2.id, cm3.id]);
+
+      const result = delStorage6.deleteMemory(cm1.id);
+
+      // Cluster should still exist but with only 2 members
+      const clusters = delStorage6.getUnreviewedClusters(10);
+      const scrubbed = clusters.length === 1 && clusters[0].cluster.memory_ids.length === 2 &&
+        !clusters[0].cluster.memory_ids.includes(cm1.id);
+
+      ecResults.push({
+        name: "Delete scrubs from cluster",
+        pass: result.deleted && result.clustersAffected === 1 && scrubbed,
+        note: `affected=${result.clustersAffected} remaining=${clusters[0]?.cluster.memory_ids.length ?? 0}`,
+      });
+
+      delStorage6.close();
+      if (existsSync(delDb6)) unlinkSync(delDb6);
+    }
+
+    // EC23: Delete memory making cluster < 2 — cluster should be deleted entirely
+    {
+      const delDb7 = join(tmpdir(), `cortex-bench-del7-${Date.now()}.db`);
+      const delStorage7 = new CortexStorage(delDb7, { unsafeSkipPathCheck: true });
+
+      const sm1 = delStorage7.saveMemory("Small cluster mem 1", "fact");
+      const sm2 = delStorage7.saveMemory("Small cluster mem 2", "fact");
+      delStorage7.savePendingCluster([sm1.id, sm2.id]);
+
+      delStorage7.deleteMemory(sm1.id);
+
+      const clusters = delStorage7.getUnreviewedClusters(10);
+      ecResults.push({
+        name: "Delete removes small cluster",
+        pass: clusters.length === 0,
+        note: `clusters remaining=${clusters.length}`,
+      });
+
+      delStorage7.close();
+      if (existsSync(delDb7)) unlinkSync(delDb7);
+    }
+
+    // EC24: Delete already-superseded memory — should work cleanly
+    {
+      const delDb8 = join(tmpdir(), `cortex-bench-del8-${Date.now()}.db`);
+      const delStorage8 = new CortexStorage(delDb8, { unsafeSkipPathCheck: true });
+
+      const m = delStorage8.saveMemory("Will be superseded then deleted", "fact");
+      const emb = await embedLocal(m.content);
+      delStorage8.saveEmbedding(m.id, emb);
+      delStorage8.supersedeMemory(m.id);
+
+      const result = delStorage8.deleteMemory(m.id);
+      const memAfter = delStorage8.getMemoryById(m.id);
+      const embAfter = delStorage8.getEmbedding(m.id);
+
+      ecResults.push({
+        name: "Delete superseded memory",
+        pass: result.deleted && memAfter === null && embAfter === null,
+        note: `deleted=${result.deleted} cleaned=${memAfter === null && embAfter === null}`,
+      });
+
+      delStorage8.close();
+      if (existsSync(delDb8)) unlinkSync(delDb8);
+    }
+
+    // EC25: Delete twice — second delete should be idempotent (deleted=false)
+    {
+      const delDb9 = join(tmpdir(), `cortex-bench-del9-${Date.now()}.db`);
+      const delStorage9 = new CortexStorage(delDb9, { unsafeSkipPathCheck: true });
+
+      const m = delStorage9.saveMemory("Delete me twice", "fact");
+      delStorage9.saveEmbedding(m.id, await embedLocal(m.content));
+
+      const first = delStorage9.deleteMemory(m.id);
+      const second = delStorage9.deleteMemory(m.id);
+
+      ecResults.push({
+        name: "Double delete idempotent",
+        pass: first.deleted && !second.deleted,
+        note: `first=${first.deleted} second=${second.deleted}`,
+      });
+
+      delStorage9.close();
+      if (existsSync(delDb9)) unlinkSync(delDb9);
+    }
+
+    // EC26: Delete memory then verify count decremented
+    {
+      const delDb10 = join(tmpdir(), `cortex-bench-del10-${Date.now()}.db`);
+      const delStorage10 = new CortexStorage(delDb10, { unsafeSkipPathCheck: true });
+
+      delStorage10.saveMemory("Survivor 1", "fact");
+      const victim = delStorage10.saveMemory("To be deleted", "fact");
+      delStorage10.saveMemory("Survivor 2", "fact");
+
+      const countBefore = delStorage10.getMemoryCount();
+      delStorage10.deleteMemory(victim.id);
+      const countAfter = delStorage10.getMemoryCount();
+
+      ecResults.push({
+        name: "Delete decrements count",
+        pass: countBefore === 3 && countAfter === 2,
+        note: `before=${countBefore} after=${countAfter}`,
+      });
+
+      delStorage10.close();
+      if (existsSync(delDb10)) unlinkSync(delDb10);
+    }
+
+    ecStorage.close();
+    if (existsSync(edgeCaseDb)) unlinkSync(edgeCaseDb);
+
+    // Tally edge case results
+    const ecPassed = ecResults.filter((r) => r.pass).length;
+    const ecTotal = ecResults.length;
+    const ecRate = (ecPassed / ecTotal) * 100;
+
+    results.push({
+      label: "Edge case pass rate",
+      value: ecRate,
+      unit: "%",
+      note: `${ecPassed}/${ecTotal} passed`,
+      pass: ecRate === 100,
+    });
+
+    // -----------------------------------------------------------------------
     // RESULTS TABLE
     // -----------------------------------------------------------------------
 
@@ -687,6 +1259,7 @@ async function main() {
       { header: "Correctness",              indices: [20, 21, 22] },
       { header: "Scheduler / proactive",    indices: [23, 24, 25] },
       { header: "Storage",                  indices: [26, 27, 28] },
+      { header: "Edge cases",               indices: [29] },
     ];
 
     for (const sec of sections) {
@@ -706,6 +1279,14 @@ async function main() {
     const evaluated = results.filter((r) => r.pass !== undefined);
     const passed    = evaluated.filter((r) => r.pass === true);
     const failed    = evaluated.filter((r) => r.pass === false);
+
+    // Edge case detail breakdown
+    if (ecResults.length > 0) {
+      console.log(`\n  ── Edge case details`);
+      for (const ec of ecResults) {
+        console.log(`  ${ec.pass ? "✓" : "✗"} ${ec.name.padEnd(35)} ${ec.note}`);
+      }
+    }
 
     console.log("\n" + "═".repeat(W));
     console.log(`  SCORE: ${passed.length}/${evaluated.length} checks passed`);
